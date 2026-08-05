@@ -15,15 +15,16 @@ SAP에 쌓인 ABAP 소스 분석 결과(유닛 단위 LLM 요약)를 **로컬 �
 2. [아키텍처 / 데이터 흐름](#아키텍처--데이터-흐름)
 3. [요구 사항](#요구-사항)
 4. [설치](#설치)
-5. [설정 (.env)](#설정-env)
-6. [인덱싱](#인덱싱)
-7. [Claude Desktop 등록](#claude-desktop-등록)
-8. [MCP 툴](#mcp-툴)
-9. [사용 예시 (Claude Desktop)](#사용-예시-claude-desktop)
-10. [증분 갱신 전략](#증분-갱신-전략)
-11. [파일 구조](#파일-구조)
-12. [트러블슈팅](#트러블슈팅)
-13. [설계 원칙 / 주의사항](#설계-원칙--주의사항)
+5. [다른 PC에서 사용 (윈도우 이전)](#다른-pc에서-사용-윈도우-이전)
+6. [설정 (.env)](#설정-env)
+7. [인덱싱](#인덱싱)
+8. [Claude Desktop 등록](#claude-desktop-등록)
+9. [MCP 툴](#mcp-툴)
+10. [사용 예시 (Claude Desktop)](#사용-예시-claude-desktop)
+11. [증분 갱신 전략](#증분-갱신-전략)
+12. [파일 구조](#파일-구조)
+13. [트러블슈팅](#트러블슈팅)
+14. [설계 원칙 / 주의사항](#설계-원칙--주의사항)
 
 ---
 
@@ -99,9 +100,16 @@ bge-m3를 씁니다.)
 
 ## 설치
 
+**macOS / Linux**
 ```bash
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements.txt
+```
+
+**Windows** (이후 문서의 `./.venv/bin/python` 은 `.venv\Scripts\python` 으로 읽으세요)
+```bat
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 > **mcp 버전 주의**: `mcp[cli]`는 **1.x**로 고정돼 있습니다(`>=1.2.0,<2`).
@@ -109,10 +117,53 @@ python3 -m venv .venv
 > 사라졌기 때문입니다.
 
 첫 임베딩 실행 시 bge-m3(~2GB)가 `./.hf_cache/`로 자동 다운로드됩니다(1회, 인터넷 필요).
+가속 디바이스는 자동 선택됩니다: **Apple Silicon=MPS → NVIDIA=CUDA → 그 외=CPU**.
+(윈도우엔 MPS가 없어 CPU/CUDA로 동작 — 검색은 즉시, 대량 인덱싱만 다소 느림.)
 
 ```bash
-./.venv/bin/python embedder.py   # 모델 다운로드 + MPS 임베딩 동작 확인
+./.venv/bin/python embedder.py   # 모델 다운로드 + 임베딩 동작 확인 (device 로그 확인)
 ```
+
+---
+
+## 다른 PC에서 사용 (윈도우 이전)
+
+GitHub엔 **코드만** 있습니다. 아래 3개는 `.gitignore` 대상이라 **각 PC에서 따로** 준비합니다.
+
+| 항목 | 어떻게 | 비고 |
+|---|---|---|
+| `.env` | **수동 복사/작성** (필수!) | 없으면 서버·인덱서 시작 불가 |
+| `.venv/` | 새로 생성 + 설치 | OS별 바이너리 |
+| `chroma_db/` (인덱스) | **재인덱싱** 또는 폴더 복사 | 벡터 데이터 |
+| `.hf_cache/` (모델 2GB) | 첫 실행 시 자동 다운로드 | 선택적으로 복사 가능 |
+
+**순서:**
+
+```bat
+git clone git@github.com:jaykim81/saprag.git
+cd saprag
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+1. **`.env` 배치** — 기존 PC의 `.env` 복사 또는 `.env.example` 보고 작성. **필수** (SAP 접속정보).
+2. **인덱스 채우기 (둘 중 하나만)**
+   - **A) 새로 인덱싱**: `.venv\Scripts\python indexer.py --full`
+     → 실행 시 bge-m3 모델(~2GB) 자동 다운로드 후 SAP에서 전량 인덱싱.
+   - **B) 폴더 복사**: 기존 PC의 `chroma_db/` 를 통째로 복사 → 재인덱싱 없이 바로 검색.
+     (Chroma 파일은 OS 호환. 첫 검색 때 모델만 자동 다운로드 — `.hf_cache/`까지 복사하면 그것도 생략.)
+3. **Claude Desktop 등록** — 윈도우 경로로 (`%APPDATA%\Claude\claude_desktop_config.json`):
+   ```json
+   "saprag": {
+     "command": "C:\\path\\to\\saprag\\.venv\\Scripts\\python.exe",
+     "args": ["C:\\path\\to\\saprag\\saprag_mcp.py"]
+   }
+   ```
+   저장 후 Claude Desktop 재시작.
+
+> ⚠️ 각 PC는 **독립된 로컬 인덱스**를 가집니다(자동 동기화 아님). 각자 `chroma_db/`를
+> 두고 각자 갱신(`--incremental`)합니다. 하나의 공유 인덱스가 필요하면 Chroma를
+> 네트워크 서버로 띄우는 별도 구성이 필요하며, 현재 규모엔 과합니다.
 
 ---
 
