@@ -67,7 +67,8 @@ def _max_anlz(rows: list[dict], cur_date: str, cur_time: str) -> tuple[str, str]
     return cur_date, cur_time
 
 
-def run(mode: str, *, prog: str | None = None, test_n: int = 5) -> None:
+def run(mode: str, *, prog: str | None = None, test_n: int = 5,
+        update_state: bool = True) -> dict:
     collection = store.get_collection()
     state = _load_state()
 
@@ -90,13 +91,14 @@ def run(mode: str, *, prog: str | None = None, test_n: int = 5) -> None:
 
     if not rows:
         print("반출된 유닛 없음 — 종료.", file=sys.stderr)
-        return
+        return {"mode": mode, "prog": prog, "fetched": 0, "indexed": 0,
+                "total": collection.count()}
 
     print(f"임베딩 모델 로드: {embedder.EMBED_MODEL} (device={embedder._pick_device()})", file=sys.stderr)
     n = _index_rows(rows, collection)
 
-    # 증분 기준 시각 갱신 (test 모드는 상태 안 건드림)
-    if mode in ("full", "incremental"):
+    # 증분 기준 시각 갱신 — 전역 워터마크는 프로그램 한정 실행에선 건드리지 않음
+    if mode in ("full", "incremental") and update_state:
         d = state.get("last_anlz_date", "")
         t = state.get("last_anlz_time", "")
         d, t = _max_anlz(rows, d, t)
@@ -106,7 +108,41 @@ def run(mode: str, *, prog: str | None = None, test_n: int = 5) -> None:
         state["count"] = collection.count()
         _save_state(state)
 
-    print(f"완료: {n}건 인덱싱. 컬렉션 총 {collection.count()}건.", file=sys.stderr)
+    total = collection.count()
+    print(f"완료: {n}건 인덱싱. 컬렉션 총 {total}건.", file=sys.stderr)
+    return {"mode": mode, "prog": prog, "fetched": len(rows), "indexed": n, "total": total}
+
+
+def prune_deleted(*, status: str = "C", do_delete: bool = False) -> dict:
+    """삭제(또는 완료상태 해제)된 유닛의 유령 벡터를 찾아 정리한다.
+
+    타임스탬프로는 삭제를 감지할 수 없어, SAP 현재 키 전체 ↔ Chroma 키 전체를
+    대조한다(키만 수집, 임베딩 없음). do_delete=False 면 미리보기만.
+    반환: {sap_count, chroma_count, ghost_count, ghosts_sample, deleted?}.
+    """
+    collection = store.get_collection()
+
+    sap_ids: set[str] = set()
+    for row in sap_client.iter_all_units(status=status):
+        sap_ids.add(store.unit_id(row))
+    print(f"[prune] SAP 현재 키 {len(sap_ids)}건 수집", file=sys.stderr)
+
+    chroma_ids = set(collection.get(include=[]).get("ids") or [])
+    ghosts = sorted(chroma_ids - sap_ids)
+    result = {
+        "sap_count": len(sap_ids),
+        "chroma_count": len(chroma_ids),
+        "ghost_count": len(ghosts),
+        "ghosts_sample": ghosts[:20],
+    }
+    print(f"[prune] 유령 벡터 {len(ghosts)}건 발견", file=sys.stderr)
+
+    if do_delete and ghosts:
+        collection.delete(ids=ghosts)
+        result["deleted"] = len(ghosts)
+        result["total_after"] = collection.count()
+        print(f"[prune] {len(ghosts)}건 삭제. 총 {result['total_after']}건.", file=sys.stderr)
+    return result
 
 
 def main():
@@ -115,9 +151,17 @@ def main():
     g.add_argument("--test", action="store_true", help="소량 end-to-end 검증")
     g.add_argument("--full", action="store_true", help="전체 재인덱싱")
     g.add_argument("--incremental", action="store_true", help="증분 갱신")
+    g.add_argument("--prune", action="store_true",
+                   help="유령 벡터 정리 (기본 미리보기, --yes 로 실제 삭제)")
     ap.add_argument("--prog", help="특정 프로그램만")
     ap.add_argument("--n", type=int, default=5, help="test 모드 건수")
+    ap.add_argument("--yes", action="store_true", help="--prune 실제 삭제 확정")
     args = ap.parse_args()
+
+    if args.prune:
+        res = prune_deleted(do_delete=args.yes)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return
 
     mode = "test" if args.test else "full" if args.full else "incremental"
     run(mode, prog=args.prog, test_n=args.n)

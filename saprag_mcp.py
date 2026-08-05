@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 import calltree
 import embedder
+import indexer
 import store
 
 mcp = FastMCP("saprag")
@@ -27,6 +28,29 @@ def _get_collection():
     if _collection is None:
         _collection = store.get_collection()
     return _collection
+
+
+def _invalidate_caches():
+    """재인덱싱 후 파생 캐시를 비운다 (call-tree 인덱스 등)."""
+    try:
+        calltree._load_index_cached.cache_clear()
+    except Exception:
+        pass
+
+
+def _read_last_indexed():
+    """index_state.json 의 마지막 인덱싱 정보(있으면)."""
+    import json
+
+    path = store._HERE / store.CHROMA_DIR / "index_state.json"
+    if path.exists():
+        try:
+            st = json.loads(path.read_text(encoding="utf-8"))
+            return {"date": st.get("last_anlz_date"), "time": st.get("last_anlz_time"),
+                    "run_at": st.get("last_run_at")}
+        except Exception:
+            return None
+    return None
 
 
 def _build_where(
@@ -148,16 +172,98 @@ def get_call_tree(prog: str, unit: str, depth: int = 2) -> dict:
 
 
 @mcp.tool()
+def reindex_incremental() -> dict:
+    """지난 인덱싱 이후 SAP에서 바뀐(신규/수정) 유닛만 가져와 벡터DB에 반영한다.
+
+    보통 수 건~수십 건이라 빠르다(수 초). "인덱싱 갱신해줘", "새로 분석된 것
+    반영해줘" 같은 요청에 사용. 기준 시각은 index_state.json에 자동 관리된다.
+    반환: {fetched, indexed, total}.
+    """
+    result = indexer.run("incremental")
+    _invalidate_caches()
+    return {"ok": True, **result}
+
+
+@mcp.tool()
+def reindex_program(prog: str) -> dict:
+    """특정 프로그램의 분석 완료 유닛을 다시 인덱싱한다 (해당 프로그램만).
+
+    "ZTM_STK00 다시 인덱싱해줘"처럼 한 프로그램만 갱신할 때 사용. 범위가
+    프로그램 하나로 한정돼 안전하다. 전역 증분 기준 시각은 건드리지 않는다.
+    반환: {fetched, indexed, total}.
+    """
+    if not (prog or "").strip():
+        return {"ok": False, "error": "prog(프로그램명)가 필요합니다."}
+    result = indexer.run("full", prog=prog.strip(), update_state=False)
+    _invalidate_caches()
+    return {"ok": True, **result}
+
+
+@mcp.tool()
+def reindex_full(confirm: bool = False) -> dict:
+    """전체 유닛을 재임베딩·재인덱싱한다 (비용이 큰 작업).
+
+    ⚠️ 모든 유닛을 다시 임베딩하므로 데이터가 많으면 수 분 이상 걸린다.
+    보통은 reindex_incremental 로 충분하며, 전체 재인덱싱은 임베딩 모델이나
+    텍스트 조합 규칙이 바뀌었을 때만 필요하다.
+
+    실수 방지를 위해 confirm=True 일 때만 실행한다. confirm 없이 호출하면
+    현재 인덱스 규모와 함께 안내만 반환한다.
+    """
+    if not confirm:
+        cnt = _get_collection().count()
+        return {
+            "ok": False,
+            "needs_confirm": True,
+            "message": (
+                f"전체 재인덱싱은 현재 약 {cnt}건을 모두 다시 임베딩합니다(수 분 소요 가능). "
+                "정말 실행하려면 confirm=True 로 다시 호출하세요. "
+                "단순 최신화라면 reindex_incremental 을 쓰세요."
+            ),
+        }
+    result = indexer.run("full")
+    _invalidate_caches()
+    return {"ok": True, **result}
+
+
+@mcp.tool()
+def prune_deleted_units(confirm: bool = False) -> dict:
+    """SAP에서 삭제(또는 완료상태 해제)된 유닛의 '유령 벡터'를 정리한다.
+
+    삭제는 타임스탬프로 감지되지 않으므로, SAP 현재 키 전체와 벡터DB 키를
+    대조해 벡터DB에만 남은 것을 찾는다(SAP 전체 페이징 1회 필요, 임베딩 없음).
+
+    confirm=False(기본): 유령 벡터가 몇 건인지 미리보기만 반환(삭제 안 함).
+    confirm=True: 실제 삭제. "유령 벡터 정리해줘"에 사용. 주기적(예: 주 1회) 권장.
+    """
+    result = indexer.prune_deleted(do_delete=confirm)
+    if confirm:
+        _invalidate_caches()
+        result["ok"] = True
+    else:
+        n = result.get("ghost_count", 0)
+        result["needs_confirm"] = n > 0
+        result["message"] = (
+            f"유령 벡터 {n}건 발견. 삭제하려면 confirm=True 로 다시 호출하세요."
+            if n else "유령 벡터 없음 — 정리 불필요."
+        )
+    return result
+
+
+@mcp.tool()
 def index_stats() -> dict:
-    """인덱스 현황 (총 유닛 수, 컬렉션명)."""
+    """인덱스 현황 (총 유닛 수, 컬렉션명, 마지막 인덱싱 시각)."""
     col = _get_collection()
     return {
         "collection": store.CHROMA_COLLECTION,
         "count": col.count(),
         "embed_model": embedder.EMBED_MODEL,
+        "last_indexed": _read_last_indexed(),
     }
 
 
 if __name__ == "__main__":
-    print("[saprag] MCP 서버 기동 (stdio). 툴: search_units, get_unit_detail, get_call_tree, index_stats", file=sys.stderr)
+    print("[saprag] MCP 서버 기동 (stdio). 툴: search_units, get_unit_detail, "
+          "get_call_tree, reindex_incremental, reindex_program, reindex_full, "
+          "prune_deleted_units, index_stats", file=sys.stderr)
     mcp.run()

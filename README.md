@@ -158,7 +158,13 @@ chmod 600 .env
 
 # 특정 프로그램만 부분 인덱싱
 ./.venv/bin/python indexer.py --full --prog ZTM_STK00
+
+# 유령 벡터 정리 — 미리보기(기본) / 실제 삭제(--yes)
+./.venv/bin/python indexer.py --prune
+./.venv/bin/python indexer.py --prune --yes
 ```
+
+> 인덱싱·정리는 Claude Desktop 툴로도 호출 가능 — 아래 [MCP 툴](#mcp-툴) 참고.
 
 - `IV_STATUS='C'`(분석 완료분)만 반출 → 미완성 유닛 벡터화 방지.
 - 증분 기준 시각(마지막 anlzDate/anlzTime)은 `chroma_db/index_state.json`에 기록.
@@ -223,8 +229,25 @@ macOS 설정 파일 위치: `~/Library/Application Support/Claude/claude_desktop
 ]}
 ```
 
+### `reindex_incremental()`
+지난 인덱싱 이후 SAP에서 **바뀐(신규/수정) 유닛만** 가져와 반영. 빠름(수 초).
+Claude Desktop에서 "인덱싱 갱신해줘"로 호출. 반환 `{fetched, indexed, total}`.
+
+### `reindex_program(prog)`
+특정 프로그램의 완료 유닛만 재인덱싱 ("ZTM_STK00 다시 인덱싱해줘"). 범위가
+한정돼 안전하고, 전역 증분 기준 시각은 건드리지 않음.
+
+### `reindex_full(confirm=False)`
+**전체 재임베딩**(비용 큼). 실수 방지를 위해 `confirm=True`일 때만 실행 — 없이
+호출하면 규모 안내만 반환. 모델/텍스트 규칙 변경 시에만 필요.
+
+### `prune_deleted_units(confirm=False)`
+SAP에서 **삭제(또는 완료상태 해제)된 유닛의 유령 벡터 정리**. 타임스탬프로는
+삭제가 감지되지 않으므로 SAP 현재 키 ↔ 벡터DB 키를 대조. `confirm=False`면
+몇 건인지 **미리보기만**, `confirm=True`면 실제 삭제. 주기적(주 1회) 권장.
+
 ### `index_stats()`
-인덱스 현황 — 총 유닛 수, 컬렉션명, 임베딩 모델.
+인덱스 현황 — 총 유닛 수, 컬렉션명, 임베딩 모델, 마지막 인덱싱 시각.
 
 ---
 
@@ -237,7 +260,13 @@ macOS 설정 파일 위치: `~/Library/Application Support/Claude/claude_desktop
 |---|---|
 | **수정된 유닛** | anlzDate 갱신 → 반출 → 같은 키로 upsert(덮어쓰기) |
 | **신규 유닛** | 새 행 → 반출 → 삽입 |
-| **삭제된 유닛** | ⚠️ anlzDate로 안 잡힘 → 유령 벡터 잔존. 주기적으로 SAP 현재 키 ↔ Chroma 키 비교 후 정리(추후 스크립트). |
+| **삭제된 유닛** | ⚠️ anlzDate로 안 잡힘 → 유령 벡터 잔존. `prune_deleted_units` 툴 또는 `indexer.py --prune`로 SAP 키 ↔ Chroma 키 대조 후 정리(주 1회 권장). |
+
+인덱싱은 CLI(`indexer.py`)뿐 아니라 **Claude Desktop에서 툴로 직접** 호출할 수
+있습니다 — `reindex_incremental`, `reindex_program`, `reindex_full`,
+`prune_deleted_units`. "인덱싱 갱신해줘", "ZTM_STK00 다시 인덱싱해줘",
+"유령 벡터 정리해줘" 같은 자연어로 트리거됩니다. (전체 재인덱싱·삭제는
+`confirm=True` 가드로 실수 방지. 대량 재인덱싱은 CLI가 더 안정적일 수 있음.)
 
 **전체 재벡터화가 필요한 드문 경우**: 임베딩 모델 교체, 또는 벡터화 대상 텍스트
 조합 규칙(`store.unit_text`) 변경 시에만. 데이터 몇 건 변경으로는 절대 전체 안 함.
@@ -253,7 +282,7 @@ SAPRAG/
 ├── store.py          # 유닛→(ID/텍스트/메타) 매핑 + Chroma 컬렉션(cosine)
 ├── calltree.py       # callRef 기반 호출관계 트리 구성
 ├── indexer.py        # 반출→임베딩→upsert (test/full/incremental)
-├── saprag_mcp.py     # MCP 서버 (search_units/get_unit_detail/get_call_tree/index_stats)
+├── saprag_mcp.py     # MCP 서버 (검색 3 + 인덱싱/정리 4 + 현황 1 = 8개 툴)
 ├── requirements.txt
 ├── .env.example      # 설정 템플릿 (실제 .env 는 git 제외)
 ├── .gitignore
