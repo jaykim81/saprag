@@ -19,10 +19,11 @@ SAP에 쌓인 ABAP 소스 분석 결과(유닛 단위 LLM 요약)를 **로컬 �
 6. [인덱싱](#인덱싱)
 7. [Claude Desktop 등록](#claude-desktop-등록)
 8. [MCP 툴](#mcp-툴)
-9. [증분 갱신 전략](#증분-갱신-전략)
-10. [파일 구조](#파일-구조)
-11. [트러블슈팅](#트러블슈팅)
-12. [설계 원칙 / 주의사항](#설계-원칙--주의사항)
+9. [사용 예시 (Claude Desktop)](#사용-예시-claude-desktop)
+10. [증분 갱신 전략](#증분-갱신-전략)
+11. [파일 구조](#파일-구조)
+12. [트러블슈팅](#트러블슈팅)
+13. [설계 원칙 / 주의사항](#설계-원칙--주의사항)
 
 ---
 
@@ -248,6 +249,45 @@ SAP에서 **삭제(또는 완료상태 해제)된 유닛의 유령 벡터 정리
 
 ### `index_stats()`
 인덱스 현황 — 총 유닛 수, 컬렉션명, 임베딩 모델, 마지막 인덱싱 시각.
+
+---
+
+## 사용 예시 (Claude Desktop)
+
+Claude Desktop 채팅창에 **자연어로** 말하면 Claude가 알아서 아래 툴을 호출합니다.
+(툴 이름·파라미터를 직접 칠 필요 없음)
+
+### 🔍 검색
+
+| 하고 싶은 것 | 이렇게 말하면 | 호출되는 툴 |
+|---|---|---|
+| 로직 위치 찾기 | "받을어음 처리 로직 어디 있어?" | `search_units(query="받을어음 처리")` |
+| 필터 검색 | "ZTM_ 프로그램 중 재고 수량 계산하는 폼 찾아줘" | `search_units(query="재고 수량 계산", prog_prefix="ZTM_", unit_type="FORM")` |
+| 개수 제한 | "공급업체 이름 가져오는 메서드 상위 5개만" | `search_units(query="공급업체 이름 조회", unit_type="METHOD", top_k=5)` |
+| 유닛 상세 | "ZSFC_FB_COM의 MAKE_FIELDCATALOG 상세히 보여줘" | `get_unit_detail(prog="ZSFC_FB_COM", unit="MAKE_FIELDCATALOG")` |
+| 호출관계 | "ZSFR_2110의 SCREEN_PAI 호출 흐름 3단계까지 보여줘" | `get_call_tree(prog="ZSFR_2110", unit="SCREEN_PAI", depth=3)` |
+
+**연속 흐름 예:**
+> "받을어음 처리 찾아줘" → (결과 중 하나 선택) "이거 상세 보여줘" → "얘가 뭘 호출하는지 트리로"
+
+### 🔄 인덱싱 · 정리
+
+| 하고 싶은 것 | 이렇게 말하면 | 호출되는 툴 |
+|---|---|---|
+| 최신화(일상) | "인덱싱 갱신해줘" / "새로 분석된 것 반영해줘" | `reindex_incremental()` |
+| 한 프로그램만 | "ZTM_STK00 다시 인덱싱해줘" | `reindex_program(prog="ZTM_STK00")` |
+| 전체 재인덱싱 | "전체 다시 인덱싱해줘" → 규모 안내 → "응 확정" | `reindex_full()` → `reindex_full(confirm=True)` |
+| 유령 벡터 확인 | "유령 벡터 몇 개 있나 확인해줘" | `prune_deleted_units()` (미리보기) |
+| 유령 벡터 삭제 | "유령 벡터 정리해줘" → 건수 확인 → "응 지워" | `prune_deleted_units(confirm=True)` |
+
+> `reindex_full` · `prune_deleted_units` 삭제는 **confirm 가드**가 있어, 확정 전에는
+> 규모/건수 안내만 반환합니다(실수 방지).
+
+### 📊 현황
+
+| 하고 싶은 것 | 이렇게 말하면 | 호출되는 툴 |
+|---|---|---|
+| 인덱스 상태 | "지금 인덱스에 몇 건 있어?" / "마지막으로 언제 인덱싱했어?" | `index_stats()` |
 
 ---
 
