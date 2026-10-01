@@ -8,7 +8,10 @@ Claude Desktop이 이 서버의 툴을 호출해 관련 ABAP 유닛을 검색한
 from __future__ import annotations
 
 import sys
-from typing import Any, Optional
+import threading
+import uuid
+from datetime import datetime
+from typing import Any, Callable, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -21,6 +24,87 @@ mcp = FastMCP("saprag")
 
 # 컬렉션은 최초 검색 시 lazy 로드 (서버 기동 속도 확보)
 _collection = None
+
+# ─── 백그라운드 재인덱싱 잡 ────────────────────────────────────────────────
+# 재인덱싱은 SAP 반출 + 임베딩으로 수 분까지 걸릴 수 있다. MCP 툴을 동기로
+# 돌리면 커넥터 요청 타임아웃에 걸려(서버는 계속 돌지만) 결과를 못 돌려준다.
+# → 별도 스레드로 던지고 즉시 리턴, 진행상황은 reindex_status 로 폴링한다.
+_job_lock = threading.Lock()
+_job: Optional[dict] = None  # 동시에 한 건만 실행
+
+
+def _public_job(job: Optional[dict]) -> Optional[dict]:
+    """잡 상태를 외부 노출용으로 정리(내부 콜백/스레드 참조 제외)."""
+    if not job:
+        return None
+    return {k: v for k, v in job.items() if k != "_worker"}
+
+
+def _run_job(job: dict, worker: Callable[[dict], dict]) -> None:
+    try:
+        result = worker(job)
+        job["result"] = result
+        job["indexed"] = result.get("indexed", job.get("indexed"))
+        job["fetched"] = result.get("fetched", job.get("fetched"))
+        job["total"] = result.get("total")
+        job["status"] = "done"
+        job["phase"] = "done"
+    except Exception as e:  # noqa: BLE001 — 잡 실패를 상태로 남긴다
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _invalidate_caches()
+
+
+def _start_reindex_job(kind: str, meta: dict,
+                       worker: Callable[[dict], dict]) -> dict:
+    """재인덱싱 잡을 백그라운드로 시작하고 즉시 리턴한다."""
+    global _job
+    with _job_lock:
+        if _job is not None and _job.get("status") == "running":
+            return {
+                "ok": False,
+                "busy": True,
+                "message": "이미 인덱싱 작업이 진행 중입니다. reindex_status 로 확인하세요.",
+                "job": _public_job(_job),
+            }
+        job = {
+            "job_id": uuid.uuid4().hex[:12],
+            "kind": kind,
+            "meta": meta,
+            "status": "running",
+            "phase": "starting",  # starting→fetching→embedding→finalizing→done
+            "fetched": None,
+            "indexed": 0,
+            "total": None,
+            "result": None,
+            "error": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _job = job
+    threading.Thread(target=_run_job, args=(job, worker), daemon=True).start()
+    return {
+        "ok": True,
+        "status": "started",
+        "job_id": job["job_id"],
+        "message": (
+            "백그라운드로 인덱싱을 시작했습니다. 잠시 뒤 reindex_status 로 "
+            "진행상황/완료를 확인하세요 (타임아웃 없이 안전하게 완료됩니다)."
+        ),
+    }
+
+
+def _make_progress_hooks(job: dict):
+    def on_phase(p: str) -> None:
+        job["phase"] = p
+
+    def on_progress(done: int, total: int) -> None:
+        job["indexed"] = done
+        job["fetched"] = total
+
+    return on_phase, on_progress
 
 
 def _get_collection():
@@ -175,13 +259,17 @@ def get_call_tree(prog: str, unit: str, depth: int = 2) -> dict:
 def reindex_incremental() -> dict:
     """지난 인덱싱 이후 SAP에서 바뀐(신규/수정) 유닛만 가져와 벡터DB에 반영한다.
 
-    보통 수 건~수십 건이라 빠르다(수 초). "인덱싱 갱신해줘", "새로 분석된 것
-    반영해줘" 같은 요청에 사용. 기준 시각은 index_state.json에 자동 관리된다.
-    반환: {fetched, indexed, total}.
+    보통 수 건~수십 건이라 빠르지만, SAP 반출+임베딩이 커넥터 타임아웃을
+    넘길 수 있어 백그라운드로 실행하고 즉시 리턴한다. 진행상황/완료는
+    reindex_status 로 확인한다. "인덱싱 갱신해줘", "새로 분석된 것 반영해줘"
+    같은 요청에 사용. 기준 시각은 index_state.json에 자동 관리된다.
+    반환: {ok, status:"started", job_id} (또는 busy 시 진행 중 잡 정보).
     """
-    result = indexer.run("incremental")
-    _invalidate_caches()
-    return {"ok": True, **result}
+    def worker(job: dict) -> dict:
+        on_phase, on_progress = _make_progress_hooks(job)
+        return indexer.run("incremental", on_phase=on_phase, on_progress=on_progress)
+
+    return _start_reindex_job("incremental", {}, worker)
 
 
 @mcp.tool()
@@ -190,13 +278,19 @@ def reindex_program(prog: str) -> dict:
 
     "ZTM_STK00 다시 인덱싱해줘"처럼 한 프로그램만 갱신할 때 사용. 범위가
     프로그램 하나로 한정돼 안전하다. 전역 증분 기준 시각은 건드리지 않는다.
-    반환: {fetched, indexed, total}.
+    백그라운드로 실행하고 즉시 리턴 — 완료는 reindex_status 로 확인한다.
+    반환: {ok, status:"started", job_id}.
     """
-    if not (prog or "").strip():
+    prog = (prog or "").strip()
+    if not prog:
         return {"ok": False, "error": "prog(프로그램명)가 필요합니다."}
-    result = indexer.run("full", prog=prog.strip(), update_state=False)
-    _invalidate_caches()
-    return {"ok": True, **result}
+
+    def worker(job: dict) -> dict:
+        on_phase, on_progress = _make_progress_hooks(job)
+        return indexer.run("full", prog=prog, update_state=False,
+                           on_phase=on_phase, on_progress=on_progress)
+
+    return _start_reindex_job("program", {"prog": prog}, worker)
 
 
 @mcp.tool()
@@ -208,7 +302,8 @@ def reindex_full(confirm: bool = False) -> dict:
     텍스트 조합 규칙이 바뀌었을 때만 필요하다.
 
     실수 방지를 위해 confirm=True 일 때만 실행한다. confirm 없이 호출하면
-    현재 인덱스 규모와 함께 안내만 반환한다.
+    현재 인덱스 규모와 함께 안내만 반환한다. confirm=True 면 백그라운드로
+    실행하고 즉시 리턴 — 완료는 reindex_status 로 확인한다.
     """
     if not confirm:
         cnt = _get_collection().count()
@@ -221,9 +316,34 @@ def reindex_full(confirm: bool = False) -> dict:
                 "단순 최신화라면 reindex_incremental 을 쓰세요."
             ),
         }
-    result = indexer.run("full")
-    _invalidate_caches()
-    return {"ok": True, **result}
+
+    def worker(job: dict) -> dict:
+        on_phase, on_progress = _make_progress_hooks(job)
+        return indexer.run("full", on_phase=on_phase, on_progress=on_progress)
+
+    return _start_reindex_job("full", {}, worker)
+
+
+@mcp.tool()
+def reindex_status(job_id: Optional[str] = None) -> dict:
+    """백그라운드 재인덱싱 잡의 진행상황/완료 여부를 조회한다.
+
+    reindex_incremental/reindex_program/reindex_full 호출 뒤 이 툴로 폴링한다.
+    job_id 를 주면 그 잡이 최근 잡과 같을 때만 매칭(현재 서버는 1개 슬롯 유지).
+    반환 status: running(진행 중) / done(완료) / error(실패) / none(잡 없음).
+    running 이면 phase(fetching/embedding/finalizing)와 indexed/fetched 진척.
+    """
+    with _job_lock:
+        job = _job
+    if job is None:
+        return {"status": "none", "message": "실행된 재인덱싱 잡이 없습니다."}
+    if job_id and job_id != job.get("job_id"):
+        return {
+            "status": "none",
+            "message": f"job_id {job_id} 에 해당하는 잡이 없습니다(최근 잡: {job.get('job_id')}).",
+            "latest": _public_job(job),
+        }
+    return {"ok": True, **_public_job(job)}
 
 
 @mcp.tool()
@@ -265,5 +385,5 @@ def index_stats() -> dict:
 if __name__ == "__main__":
     print("[saprag] MCP 서버 기동 (stdio). 툴: search_units, get_unit_detail, "
           "get_call_tree, reindex_incremental, reindex_program, reindex_full, "
-          "prune_deleted_units, index_stats", file=sys.stderr)
+          "reindex_status, prune_deleted_units, index_stats", file=sys.stderr)
     mcp.run()

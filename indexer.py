@@ -35,8 +35,13 @@ def _save_state(state: dict) -> None:
     _STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _index_rows(rows: list[dict], collection, *, batch: int = 64) -> int:
-    """행 리스트를 임베딩 후 Chroma에 upsert. 처리 건수 반환."""
+def _index_rows(rows: list[dict], collection, *, batch: int = 64,
+                on_progress=None) -> int:
+    """행 리스트를 임베딩 후 Chroma에 upsert. 처리 건수 반환.
+
+    on_progress(done, total_rows) 콜백을 주면 청크마다 진행상황을 통지한다
+    (백그라운드 잡의 진척률 표시용).
+    """
     total = 0
     for i in range(0, len(rows), batch):
         chunk = rows[i : i + batch]
@@ -54,6 +59,11 @@ def _index_rows(rows: list[dict], collection, *, batch: int = 64) -> int:
         collection.upsert(ids=ids, embeddings=vecs, documents=docs, metadatas=metas)
         total += len(docs)
         print(f"  … upsert {total}건 누적", file=sys.stderr)
+        if on_progress:
+            try:
+                on_progress(total, len(rows))
+            except Exception:
+                pass
     return total
 
 
@@ -68,7 +78,16 @@ def _max_anlz(rows: list[dict], cur_date: str, cur_time: str) -> tuple[str, str]
 
 
 def run(mode: str, *, prog: str | None = None, test_n: int = 5,
-        update_state: bool = True) -> dict:
+        update_state: bool = True, on_progress=None, on_phase=None) -> dict:
+    """인덱싱 실행. on_phase(phase:str) / on_progress(done, total) 콜백은
+    백그라운드 잡에서 진행상황을 노출하기 위한 선택 훅이다."""
+    def _phase(p: str) -> None:
+        if on_phase:
+            try:
+                on_phase(p)
+            except Exception:
+                pass
+
     collection = store.get_collection()
     state = _load_state()
 
@@ -79,6 +98,7 @@ def run(mode: str, *, prog: str | None = None, test_n: int = 5,
         from_time = state.get("last_anlz_time") or None
         print(f"[incremental] IV_FROM_DATE={from_date} IV_FROM_TIME={from_time}", file=sys.stderr)
 
+    _phase("fetching")
     if mode == "test":
         page = sap_client.fetch_units(limit=test_n, offset=0, prog=prog)
         rows = (page.get("rows") or [])[:test_n]
@@ -95,7 +115,9 @@ def run(mode: str, *, prog: str | None = None, test_n: int = 5,
                 "total": collection.count()}
 
     print(f"임베딩 모델 로드: {embedder.EMBED_MODEL} (device={embedder._pick_device()})", file=sys.stderr)
-    n = _index_rows(rows, collection)
+    _phase("embedding")
+    n = _index_rows(rows, collection, on_progress=on_progress)
+    _phase("finalizing")
 
     # 증분 기준 시각 갱신 — 전역 워터마크는 프로그램 한정 실행에선 건드리지 않음
     if mode in ("full", "incremental") and update_state:
